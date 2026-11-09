@@ -1,0 +1,12 @@
+# 실습 코드(.py)만 저장소에 올린다. 그 외 파일은 기본적으로 모두 제외한다.
+*
+!*/
+!*.py
+!.gitignore
+!requirements.txt
+
+# 가상환경과 캐시 안의 .py 파일은 제외한다.
+.venv/
+venv/
+env/
+__pycache__/
