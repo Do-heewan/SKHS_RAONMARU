@@ -2,7 +2,6 @@
 import serial
 import csv
 import os
-import threading
 from datetime import datetime
 
 # =========================
@@ -18,14 +17,6 @@ HEADER = b"\x3c\x02"
 DATA_DIR = "data"
 SESSION = datetime.now().strftime("%Y%m%d_%H%M%S")
 CSV_FILE = os.path.join(DATA_DIR, f"session_{SESSION}.csv")
-EVENT_FILE = os.path.join(DATA_DIR, f"events_{SESSION}.csv")
-
-# 측정 중 숫자 + Enter로 기록할 사건
-EVENTS = {
-    "1": "breath",
-    "2": "sanitizer",
-    "3": "window"
-}
 
 COLUMNS = [
     "timestamp",
@@ -67,7 +58,9 @@ def parse_frame(data):
         )
 
     return {
-        "timestamp": now_text(),
+        "timestamp": datetime.now().astimezone().isoformat(
+            timespec="milliseconds"
+        ),
         "raw_hex": data.hex(" "),
         "eco2_raw": uint16(2),
         "ech2o_raw": uint16(4),
@@ -77,12 +70,6 @@ def parse_frame(data):
         "temperature_hex": data[12:14].hex(" "),
         "humidity_hex": data[14:16].hex(" ")
     }
-
-
-def now_text():
-    return datetime.now().astimezone().isoformat(
-        timespec="milliseconds"
-    )
 
 
 # =========================
@@ -118,44 +105,7 @@ def prepare_csv():
 
 
 # =========================
-# 4. 사건 기록 (키보드 입력)
-# =========================
-
-def watch_keyboard():
-
-    needs_header = True
-
-    while True:
-
-        try:
-            key = input().strip()
-        except (EOFError, OSError):
-            return
-
-        if key not in EVENTS:
-            print("1, 2, 3 중 하나를 입력하고 Enter를 누르세요.")
-            continue
-
-        with open(
-            EVENT_FILE,
-            "a",
-            newline="",
-            encoding="utf-8"
-        ) as file:
-
-            writer = csv.writer(file)
-
-            if needs_header:
-                writer.writerow(["timestamp", "event"])
-                needs_header = False
-
-            writer.writerow([now_text(), EVENTS[key]])
-
-        print(f"*** 사건 기록: {EVENTS[key]} ***")
-
-
-# =========================
-# 5. UART 수신 및 저장
+# 4. UART 수신 및 저장
 # =========================
 
 def main():
@@ -163,18 +113,12 @@ def main():
     print("M701B CSV Data Logger")
     print(f"PORT: {PORT}")
     print(f"FILE: {CSV_FILE}")
-    print("사건 기록: 1 = 입김 / 2 = 손소독제 / 3 = 환기 (숫자 + Enter)")
     print("Ctrl+C to stop\n")
 
     buffer = bytearray()
     count = 0
 
     file, writer = prepare_csv()
-
-    threading.Thread(
-        target=watch_keyboard,
-        daemon=True
-    ).start()
 
     try:
         with serial.Serial(

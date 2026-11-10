@@ -22,9 +22,6 @@ PANELS = [
     ("Humidity", ["humidity"])
 ]
 
-BEFORE_SECONDS = 60
-AFTER_SECONDS = 180
-
 
 # =========================
 # 2. 공통 함수
@@ -38,22 +35,6 @@ def latest_clean():
         return None
 
     return max(files, key=os.path.getmtime)
-
-
-def load_events(input_file):
-
-    name = os.path.basename(input_file).replace("clean_", "events_")
-    path = os.path.join(os.path.dirname(input_file), name)
-
-    if not os.path.exists(path):
-        return None
-
-    events = pd.read_csv(path)
-    events["time"] = pd.to_datetime(
-        events["timestamp"], format="ISO8601"
-    ).dt.tz_localize(None)
-
-    return events
 
 
 def pause(args):
@@ -77,7 +58,7 @@ def show(fig, path, args):
 # 3. 항목별 시계열 그래프
 # =========================
 
-def plot_timeseries(df, events, path, args):
+def plot_timeseries(df, path, args):
 
     panels = [
         (title, [c for c in columns if c in df.columns])
@@ -102,55 +83,13 @@ def plot_timeseries(df, events, path, args):
         if len(columns) > 1:
             ax.legend(loc="upper right")
 
-        if events is not None:
-            for time in events["time"]:
-                ax.axvline(time, color="black", linestyle="--", linewidth=1)
-
-    if events is not None:
-        for _, event in events.iterrows():
-            axes[0].annotate(
-                event["event"],
-                xy=(mdates.date2num(event["time"]), 1),
-                xycoords=axes[0].get_xaxis_transform(),
-                xytext=(0, 4),
-                textcoords="offset points",
-                rotation=30
-            )
-
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     axes[-1].set_xlabel("Time")
     show(fig, path, args)
 
 
 # =========================
-# 4. 사건 전후 비교
-# =========================
-
-def compare_events(df, events):
-
-    if events is None:
-        print("기록된 사건이 없습니다. (예시 데이터에는 사건 기록이 없습니다)")
-        return
-
-    for _, event in events.iterrows():
-
-        start = event["time"]
-        before = df[(df.index >= start - pd.Timedelta(seconds=BEFORE_SECONDS))
-                    & (df.index < start)]
-        after = df[(df.index >= start)
-                   & (df.index <= start + pd.Timedelta(seconds=AFTER_SECONDS))]
-
-        print(f"\n{event['event']} ({start:%H:%M:%S})")
-
-        for column in ["eco2", "tvoc"]:
-            print(
-                f"  {column}: 직전 평균 {before[column].mean():.1f}"
-                f" -> 이후 최고 {after[column].max():.1f}"
-            )
-
-
-# =========================
-# 5. 산점도
+# 4. 산점도
 # =========================
 
 def plot_scatter(df, path, args):
@@ -167,7 +106,7 @@ def plot_scatter(df, path, args):
 
 
 # =========================
-# 6. 실행
+# 5. 실행
 # =========================
 
 def main():
@@ -185,7 +124,6 @@ def main():
         return
 
     df = pd.read_csv(input_file, parse_dates=["time"], index_col="time")
-    events = load_events(input_file)
 
     os.makedirs(RESULT_DIR, exist_ok=True)
     name = os.path.splitext(os.path.basename(input_file))[0]
@@ -193,19 +131,14 @@ def main():
 
     print(f"파일: {input_file}")
 
-    print("\n===== [1/3] 시간에 따른 공기질 변화 =====")
-    print("옅은 선은 10초 평균, 진한 선은 이동평균, 점선은 기록한 사건입니다.")
+    print("\n===== [1/2] 시간에 따른 공기질 변화 =====")
+    print("옅은 선은 10초 평균, 진한 선은 이동평균입니다.")
     plot_timeseries(
-        df, events,
-        os.path.join(RESULT_DIR, f"{name}_timeseries.png"), args
+        df, os.path.join(RESULT_DIR, f"{name}_timeseries.png"), args
     )
     pause(args)
 
-    print("\n===== [2/3] 사건 전후 비교 =====")
-    compare_events(df, events)
-    pause(args)
-
-    print("\n===== [3/3] eCO2와 TVOC의 관계 =====")
+    print("\n===== [2/2] eCO2와 TVOC의 관계 =====")
     plot_scatter(
         df, os.path.join(RESULT_DIR, f"{name}_scatter.png"), args
     )
