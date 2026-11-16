@@ -4,6 +4,7 @@
 !*.py
 !.gitignore
 !requirements.txt
+!*.csv
 
 # 가상환경과 캐시 안의 .py 파일은 제외한다.
 .venv/
