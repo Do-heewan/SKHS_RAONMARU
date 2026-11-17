@@ -10,6 +10,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 
+import altair as alt
 import pandas as pd
 import serial
 import streamlit as st
@@ -40,13 +41,19 @@ COLUMNS = [
     "humidity_hex"
 ]
 
-# 학교 교실 공기질 유지 기준 (학교보건법 시행규칙)
-STANDARDS = {
-    "eco2": ("eCO2", "ppm", 1000),
-    "pm25": ("PM2.5", "µg/m³", 35),
-    "pm10": ("PM10", "µg/m³", 75)
+SHOW_MINUTES = 10        # 그래프에 보여 줄 최근 시간(분)
+
+# 토글 버튼에 보일 이름과 그래프 색 (항목마다 색을 고정한다)
+SERIES = {
+    "eCO2": ("eco2", "#4e79a7"),
+    "TVOC": ("tvoc", "#e15759"),
+    "eCH2O": ("ech2o", "#76b7b2"),
+    "PM2.5": ("pm25", "#f28e2b"),
+    "PM10": ("pm10", "#59a14f"),
+    "Temp": ("temperature", "#b07aa1"),
+    "Humidity": ("humidity", "#9c755f")
 }
-CAUTION_RATIO = 0.8      # 기준의 80%를 넘으면 '주의'
+DEFAULT_SERIES = ["eCO2"]
 
 
 # =========================
@@ -222,101 +229,60 @@ def get_collector():
 
 
 # =========================
-# 4. 공기 상태 판단
-# =========================
-
-def judge(latest):
-
-    over, near = [], []
-
-    for key, (name, unit, limit) in STANDARDS.items():
-        value = latest[key]
-        text = f"{name} {value:,.0f}{unit} (기준 {limit:,}{unit})"
-
-        if value >= limit:
-            over.append(text)
-        elif value >= limit * CAUTION_RATIO:
-            near.append(text)
-
-    if over:
-        st.error("환기 필요: " + ", ".join(over))
-    elif near:
-        st.warning("주의: " + ", ".join(near))
-    else:
-        st.success("좋음: 모든 값이 기준보다 충분히 낮습니다.")
-
-
-# =========================
-# 5. 화면
+# 4. 화면
 # =========================
 
 st.set_page_config(page_title="라온마루 공기질", layout="wide")
-st.title("라온마루 실시간 공기질")
 
 collector = get_collector()
 
-with st.sidebar:
-    st.header("설정")
-    minutes = st.slider("그래프에 보여 줄 시간(분)", 1, 60, 10)
-    st.caption(f"저장 파일: {collector.csv_file}")
-    st.caption("판단 기준: 학교 교실 공기질 유지 기준")
-    for name, unit, limit in STANDARDS.values():
-        st.caption(f"- {name}: {limit:,} {unit}")
+# 누를 때마다 켜지고 꺼지는 토글 버튼
+selected = st.pills(
+    "항목", list(SERIES), selection_mode="multi",
+    default=DEFAULT_SERIES, label_visibility="collapsed"
+)
 
 
 @st.fragment(run_every=REFRESH)
-def live_view(minutes):
+def live_chart(selected):
 
-    rows, count = collector.snapshot()
-
-    if collector.connected:
-        st.caption(f"상태: {collector.status} · 저장한 데이터 {count:,}개")
-    else:
+    if not collector.connected:
         st.warning(collector.status)
 
+    rows, _ = collector.snapshot()
+
     if not rows:
-        st.info("데이터를 기다리는 중입니다. 센서는 약 2초마다 값을 보냅니다.")
+        st.info("데이터를 기다리는 중입니다.")
         return
 
-    df = pd.DataFrame(rows).set_index("time")
-    latest = df.iloc[-1]
+    if not selected:
+        st.info("위에서 보고 싶은 항목을 누르세요.")
+        return
 
-    # 1분 전 값과 비교해 얼마나 변했는지 보여 준다.
-    before = df[df.index <= df.index[-1] - timedelta(minutes=1)]
-    previous = before.iloc[-1] if not before.empty else df.iloc[0]
+    df = pd.DataFrame(rows)
+    df = df[df["time"] >= df["time"].iloc[-1] - timedelta(minutes=SHOW_MINUTES)]
 
-    judge(latest)
+    # 선택한 항목만 골라 '항목, 값' 형태의 긴 표로 바꾼다.
+    long = df.rename(
+        columns={column: name for name, (column, _) in SERIES.items()}
+    ).melt(id_vars="time", value_vars=selected, var_name="item", value_name="value")
 
-    cards = [
-        ("eCO2 (ppm)", "eco2", "{:,.0f}", "inverse"),
-        ("TVOC", "tvoc", "{:,.0f}", "inverse"),
-        ("PM2.5 (µg/m³)", "pm25", "{:,.0f}", "inverse"),
-        ("PM10 (µg/m³)", "pm10", "{:,.0f}", "inverse"),
-        ("온도 (°C)", "temperature", "{:.1f}", "off"),
-        ("습도 (%)", "humidity", "{:.1f}", "off")
-    ]
+    chart = alt.Chart(long).mark_line().encode(
+        x=alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M:%S")),
+        y=alt.Y("value:Q", title=None),
+        color=alt.Color(
+            "item:N", title=None,
+            # 켜진 항목만 범례에 보이되, 항목별 색은 항상 같게
+            scale=alt.Scale(
+                domain=selected,
+                range=[SERIES[name][1] for name in selected]
+            ),
+            legend=alt.Legend(orient="top")
+        ),
+        tooltip=["time:T", "item:N", "value:Q"]
+    ).properties(height=650)
 
-    for col, (label, key, fmt, color) in zip(st.columns(len(cards)), cards):
-        change = latest[key] - previous[key]
-        col.metric(
-            label, fmt.format(latest[key]),
-            delta=f"{change:+.1f} (1분)", delta_color=color
-        )
-
-    recent = df[df.index >= df.index[-1] - timedelta(minutes=minutes)]
-
-    left, right = st.columns(2)
-    left.subheader("eCO2")
-    left.line_chart(recent[["eco2"]])
-    right.subheader("TVOC")
-    right.line_chart(recent[["tvoc"]])
-
-    left.subheader("미세먼지 PM2.5 · PM10")
-    left.line_chart(recent[["pm25", "pm10"]])
-    right.subheader("온도 · 습도")
-    right.line_chart(recent[["temperature", "humidity"]])
-
-    st.caption(f"마지막 측정: {df.index[-1]:%H:%M:%S}")
+    st.altair_chart(chart, use_container_width=True)
 
 
-live_view(minutes)
+live_chart(selected)
