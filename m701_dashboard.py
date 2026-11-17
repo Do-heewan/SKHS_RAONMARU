@@ -2,6 +2,7 @@
 # 실행: streamlit run m701_dashboard.py
 # 센서 값을 수집해 CSV로 저장하면서, 같은 값을 웹 대시보드에 바로 보여 준다.
 # 같은 Wi-Fi의 다른 기기에서는 http://<라즈베리파이 IP>:8501 로 접속한다.
+# 페이지 두 개(그래프 / 요약)가 같은 수집기를 함께 쓴다. 왼쪽 메뉴에서 고른다.
 
 import csv
 import os
@@ -54,6 +55,17 @@ SERIES = {
     "Humidity": ("humidity", "#9c755f")
 }
 DEFAULT_SERIES = ["eCO2"]
+
+VALUE = "값"
+PERCENT = "변화율(%)"
+
+# 요약 페이지: 학교 교실 공기질 유지 기준 (학교보건법 시행규칙)
+STANDARDS = {
+    "eco2": ("eCO2", "ppm", 1000),
+    "pm25": ("PM2.5", "µg/m³", 35),
+    "pm10": ("PM10", "µg/m³", 75)
+}
+CAUTION_RATIO = 0.8      # 기준의 80%를 넘으면 '주의'
 
 
 # =========================
@@ -229,22 +241,11 @@ def get_collector():
 
 
 # =========================
-# 4. 화면
+# 4. 그래프 페이지
 # =========================
 
-st.set_page_config(page_title="라온마루 공기질", layout="wide")
-
-collector = get_collector()
-
-# 누를 때마다 켜지고 꺼지는 토글 버튼
-selected = st.pills(
-    "항목", list(SERIES), selection_mode="multi",
-    default=DEFAULT_SERIES, label_visibility="collapsed"
-)
-
-
 @st.fragment(run_every=REFRESH)
-def live_chart(selected):
+def live_chart(selected, mode):
 
     if not collector.connected:
         st.warning(collector.status)
@@ -267,9 +268,29 @@ def live_chart(selected):
         columns={column: name for name, (column, _) in SERIES.items()}
     ).melt(id_vars="time", value_vars=selected, var_name="item", value_name="value")
 
-    chart = alt.Chart(long).mark_line().encode(
+    if mode == PERCENT:
+        # 그래프 맨 왼쪽(처음) 값을 0%로 두고 얼마나 늘고 줄었는지 계산한다.
+        # 크기가 다른 항목(eCO2 약 900, PM2.5 약 4)도 한 그래프에서 비교할 수 있다.
+        first = long.groupby("item")["value"].transform("first")
+        long["change"] = (long["value"] - first) / first * 100
+
+        # 처음 값이 0이면 나눌 수 없으므로 그 항목은 뺀다.
+        zero = sorted(set(long.loc[first == 0, "item"]))
+        long = long[first != 0]
+
+        if zero:
+            st.caption(f"처음 값이 0이라 변화율을 계산할 수 없는 항목: {', '.join(zero)}")
+
+        y = alt.Y("change:Q", title="Change from first value (%)")
+        tooltip = ["time:T", "item:N", "value:Q",
+                   alt.Tooltip("change:Q", format="+.1f", title="change %")]
+    else:
+        y = alt.Y("value:Q", title=None)
+        tooltip = ["time:T", "item:N", "value:Q"]
+
+    lines = alt.Chart(long).mark_line().encode(
         x=alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M:%S")),
-        y=alt.Y("value:Q", title=None),
+        y=y,
         color=alt.Color(
             "item:N", title=None,
             # 켜진 항목만 범례에 보이되, 항목별 색은 항상 같게
@@ -279,10 +300,142 @@ def live_chart(selected):
             ),
             legend=alt.Legend(orient="top")
         ),
-        tooltip=["time:T", "item:N", "value:Q"]
-    ).properties(height=650)
+        tooltip=tooltip
+    )
 
-    st.altair_chart(chart, use_container_width=True)
+    chart = lines
+
+    if mode == PERCENT:
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
+            color="gray", strokeDash=[4, 4]
+        ).encode(y="y:Q")
+        chart = zero_line + lines
+
+    st.altair_chart(chart.properties(height=650), use_container_width=True)
 
 
-live_chart(selected)
+def chart_page():
+
+    # 누를 때마다 켜지고 꺼지는 토글 버튼
+    selected = st.pills(
+        "항목", list(SERIES), selection_mode="multi",
+        default=DEFAULT_SERIES, label_visibility="collapsed"
+    )
+
+    # 실제 값으로 볼지, 처음 값 대비 변화율로 볼지 고른다.
+    mode = st.segmented_control(
+        "보기", [VALUE, PERCENT], default=PERCENT,
+        label_visibility="collapsed"
+    ) or PERCENT
+
+    live_chart(selected, mode)
+
+
+# =========================
+# 5. 요약 페이지 (상태 판단, 값 카드, 그래프 4개)
+# =========================
+
+def judge(latest):
+
+    over, near = [], []
+
+    for key, (name, unit, limit) in STANDARDS.items():
+        value = latest[key]
+        text = f"{name} {value:,.0f}{unit} (기준 {limit:,}{unit})"
+
+        if value >= limit:
+            over.append(text)
+        elif value >= limit * CAUTION_RATIO:
+            near.append(text)
+
+    if over:
+        st.error("환기 필요: " + ", ".join(over))
+    elif near:
+        st.warning("주의: " + ", ".join(near))
+    else:
+        st.success("좋음: 모든 값이 기준보다 충분히 낮습니다.")
+
+
+@st.fragment(run_every=REFRESH)
+def live_view(minutes):
+
+    rows, count = collector.snapshot()
+
+    if collector.connected:
+        st.caption(f"상태: {collector.status} · 저장한 데이터 {count:,}개")
+    else:
+        st.warning(collector.status)
+
+    if not rows:
+        st.info("데이터를 기다리는 중입니다. 센서는 약 2초마다 값을 보냅니다.")
+        return
+
+    df = pd.DataFrame(rows).set_index("time")
+    latest = df.iloc[-1]
+
+    # 1분 전 값과 비교해 얼마나 변했는지 보여 준다.
+    before = df[df.index <= df.index[-1] - timedelta(minutes=1)]
+    previous = before.iloc[-1] if not before.empty else df.iloc[0]
+
+    judge(latest)
+
+    cards = [
+        ("eCO2 (ppm)", "eco2", "{:,.0f}", "inverse"),
+        ("TVOC", "tvoc", "{:,.0f}", "inverse"),
+        ("PM2.5 (µg/m³)", "pm25", "{:,.0f}", "inverse"),
+        ("PM10 (µg/m³)", "pm10", "{:,.0f}", "inverse"),
+        ("온도 (°C)", "temperature", "{:.1f}", "off"),
+        ("습도 (%)", "humidity", "{:.1f}", "off")
+    ]
+
+    for col, (label, key, fmt, color) in zip(st.columns(len(cards)), cards):
+        change = latest[key] - previous[key]
+        col.metric(
+            label, fmt.format(latest[key]),
+            delta=f"{change:+.1f} (1분)", delta_color=color
+        )
+
+    recent = df[df.index >= df.index[-1] - timedelta(minutes=minutes)]
+
+    left, right = st.columns(2)
+    left.subheader("eCO2")
+    left.line_chart(recent[["eco2"]])
+    right.subheader("TVOC")
+    right.line_chart(recent[["tvoc"]])
+
+    left.subheader("미세먼지 PM2.5 · PM10")
+    left.line_chart(recent[["pm25", "pm10"]])
+    right.subheader("온도 · 습도")
+    right.line_chart(recent[["temperature", "humidity"]])
+
+    st.caption(f"마지막 측정: {df.index[-1]:%H:%M:%S}")
+
+
+def overview_page():
+
+    st.title("라온마루 실시간 공기질")
+
+    with st.sidebar:
+        st.header("설정")
+        minutes = st.slider("그래프에 보여 줄 시간(분)", 1, 60, 10)
+        st.caption(f"저장 파일: {collector.csv_file}")
+        st.caption("판단 기준: 학교 교실 공기질 유지 기준")
+        for name, unit, limit in STANDARDS.values():
+            st.caption(f"- {name}: {limit:,} {unit}")
+
+    live_view(minutes)
+
+
+# =========================
+# 6. 실행
+# =========================
+
+st.set_page_config(page_title="라온마루 공기질", layout="wide")
+
+collector = get_collector()
+
+page = st.navigation([
+    st.Page(chart_page, title="그래프", url_path="chart", default=True),
+    st.Page(overview_page, title="요약", url_path="overview")
+])
+page.run()
