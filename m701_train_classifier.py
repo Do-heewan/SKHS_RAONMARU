@@ -50,6 +50,16 @@ def pause(args):
         input("\n다음 단계로 가려면 Enter를 누르세요...")
 
 
+# [##########----------]  50% (15/30) 설명  처럼 진행률을 한 줄에 보여 준다.
+def progress(done, total, text="", width=20):
+
+    filled = int(width * done / total)
+    bar = "#" * filled + "-" * (width - filled)
+    end = "\n" if done == total else ""
+    print(f"\r  [{bar}] {done / total * 100:3.0f}% ({done}/{total}) {text:<40}",
+          end=end, flush=True)
+
+
 def show(fig, path, args):
 
     fig.tight_layout()
@@ -156,8 +166,14 @@ def main():
 
     # 2) 특징 만들기
     step(2, "특징 만들기 (지금 값, 5분 변화량, 평소보다 높은 정도)")
-    df = pd.concat([add_features(g) for _, g in df.groupby("session")],
-                   ignore_index=True)
+    groups = list(df.groupby("session"))
+    parts = []
+
+    for index, (session, group) in enumerate(groups, start=1):
+        parts.append(add_features(group))
+        progress(index, len(groups), session)
+
+    df = pd.concat(parts, ignore_index=True)
     before = len(df)
     df = df.dropna(subset=FEATURES)
     print(f"특징: {FEATURES}")
@@ -188,9 +204,21 @@ def main():
 
     # 4) 학습
     step(4, f"결정 트리 학습 (최대 깊이 {args.depth})")
-    model = DecisionTreeClassifier(max_depth=args.depth, random_state=0)
-    model.fit(train[FEATURES], train["label"])
-    print(f"학습 데이터 정확도: {accuracy_score(train['label'], model.predict(train[FEATURES])):.3f}")
+    # 결정 트리는 한 번에 학습이 끝나므로, 깊이를 1부터 하나씩 늘려 가며
+    # 트리가 자랄수록 학습 데이터를 얼마나 더 잘 맞히는지 보여 준다.
+    # 마지막(최대 깊이) 트리를 최종 모델로 쓴다.
+    history = []
+
+    for depth in range(1, args.depth + 1):
+        model = DecisionTreeClassifier(max_depth=depth, random_state=0)
+        model.fit(train[FEATURES], train["label"])
+        score = accuracy_score(train["label"], model.predict(train[FEATURES]))
+        history.append((depth, model.get_n_leaves(), score))
+        progress(depth, args.depth, f"깊이 {depth}: 정확도 {score:.3f}")
+
+    print("\n깊이  잎 수  학습 데이터 정확도")
+    for depth, leaves, score in history:
+        print(f"{depth:>4}  {leaves:>5}  {score:.3f}")
     print("\n트리 규칙:")
     print(export_text(model, feature_names=FEATURES, decimals=1))
     print("특징 중요도:")
