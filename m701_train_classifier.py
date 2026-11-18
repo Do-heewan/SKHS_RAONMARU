@@ -142,7 +142,8 @@ def main():
         print("먼저 python m701_state_clean.py --all 을 실행하세요.")
         return
 
-    plt.rcParams["font.family"] = ["Malgun Gothic", "NanumGothic", "DejaVu Sans"]
+    # 그래프의 한글 표시용. 라즈베리파이: sudo apt install fonts-nanum
+    plt.rcParams["font.family"] = ["NanumGothic", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
     # 1) 불러오기
