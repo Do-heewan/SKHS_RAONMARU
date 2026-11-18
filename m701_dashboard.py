@@ -3,6 +3,8 @@
 # 센서 값을 수집해 CSV로 저장하면서, 같은 값을 웹 대시보드에 바로 보여 준다.
 # 같은 Wi-Fi의 다른 기기에서는 http://<라즈베리파이 IP>:8501 로 접속한다.
 # 페이지 두 개(그래프 / 요약)가 같은 수집기를 함께 쓴다. 왼쪽 메뉴에서 고른다.
+# models/printer_tree.joblib 이 있으면 3D 프린터 가동 여부도 함께 보여 준다.
+# (모델은 python m701_train_classifier.py 로 만든다.)
 
 import csv
 import os
@@ -66,6 +68,13 @@ STANDARDS = {
     "pm10": ("PM10", "µg/m³", 75)
 }
 CAUTION_RATIO = 0.8      # 기준의 80%를 넘으면 '주의'
+
+# 3D 프린터 상태 판단 (m701_live_classify.py 와 같은 방법)
+MODEL_FILE = os.path.join("models", "printer_tree.joblib")
+RESAMPLE = "10s"         # 학습 데이터와 같은 10초 평균
+WINDOW = "60s"           # 학습 데이터와 같은 60초 이동평균
+CONFIRM_BINS = 3         # 최근 3구간(30초)의 다수결로 상태를 정한다
+PRINTING_COLOR = "#e15759"
 
 
 # =========================
@@ -241,7 +250,102 @@ def get_collector():
 
 
 # =========================
-# 4. 그래프 페이지
+# 4. 3D 프린터 상태 판단
+# =========================
+
+# 모델 파일이 바뀌면(다시 학습하면) 새로 불러온다.
+@st.cache_resource
+def load_model(path, modified):
+    import joblib  # scikit-learn 이 없어도 대시보드는 열리도록 여기서 불러온다.
+    return joblib.load(path)
+
+
+def get_model():
+
+    if not os.path.exists(MODEL_FILE):
+        return None, "모델이 없습니다. python m701_train_classifier.py 로 먼저 학습하세요."
+
+    try:
+        return load_model(MODEL_FILE, os.path.getmtime(MODEL_FILE)), None
+    except Exception as error:
+        return None, f"모델을 불러오지 못했습니다: {error}"
+
+
+def predict_states(rows, bundle):
+
+    frame = pd.DataFrame(rows).set_index("time")
+
+    # 10초 평균. 아직 10초가 다 차지 않은 마지막 구간은 뺀다.
+    clean = frame[["eco2", "tvoc", "humidity"]].resample(RESAMPLE).mean()
+    clean = clean[clean.index + pd.Timedelta(RESAMPLE) <= frame.index[-1]]
+    smooth = clean.rolling(WINDOW, min_periods=1).mean()
+    smooth = smooth[clean["eco2"].notna()]
+
+    if smooth.empty:
+        return smooth
+
+    # 학습할 때와 같은 특징 (m701_train_classifier.py 참고)
+    change = f"{bundle['change_seconds']}s"
+    baseline = f"{bundle['baseline_seconds']}s"
+    features = pd.DataFrame(index=smooth.index)
+
+    for name in ["eco2", "tvoc", "humidity"]:
+        features[f"{name}_smooth"] = smooth[name]
+
+    for name in ["eco2", "tvoc", "humidity"]:
+        before = smooth[name].shift(freq=change).reindex(smooth.index)
+        features[f"{name}_change"] = smooth[name] - before
+
+    for name in ["eco2", "tvoc"]:
+        features[f"{name}_rise"] = smooth[name] - smooth[name].rolling(baseline).min()
+
+    # 5분 변화량을 잴 수 없는 처음 5분은 판단하지 않는다.
+    features = features.dropna()
+
+    if features.empty:
+        return features
+
+    model = bundle["model"]
+    printing = list(model.classes_).index(1)
+    features["probability"] = model.predict_proba(features[bundle["features"]])[:, printing]
+
+    vote = (features["probability"] >= 0.5).astype(float)
+    features["predict"] = (vote.rolling(CONFIRM_BINS, min_periods=1).mean() > 0.5).astype(int)
+
+    return features
+
+
+def printer_status(rows):
+
+    bundle, message = get_model()
+
+    if bundle is None:
+        st.caption(f"3D 프린터 판단: {message}")
+        return None
+
+    states = predict_states(rows, bundle)
+
+    if states.empty:
+        minutes = (rows[-1]["time"] - rows[0]["time"]).total_seconds() / 60
+        st.markdown(f"**3D 프린터:** :gray-background[판단 준비 중] "
+                    f"(5분 이상 데이터가 필요합니다, 지금 {minutes:.1f}분)")
+        return None
+
+    latest = states.iloc[-1]
+    probability = latest["probability"] * 100
+
+    if latest["predict"] == 1:
+        st.markdown(f"### 3D 프린터: :red-background[가동 중] "
+                    f"<small>가동 확률 {probability:.0f}%</small>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"### 3D 프린터: :green-background[평시] "
+                    f"<small>가동 확률 {probability:.0f}%</small>", unsafe_allow_html=True)
+
+    return states
+
+
+# =========================
+# 5. 그래프 페이지
 # =========================
 
 @st.fragment(run_every=REFRESH)
@@ -255,6 +359,8 @@ def live_chart(selected, mode):
     if not rows:
         st.info("데이터를 기다리는 중입니다.")
         return
+
+    states = printer_status(rows)
 
     if not selected:
         st.info("위에서 보고 싶은 항목을 누르세요.")
@@ -311,6 +417,18 @@ def live_chart(selected, mode):
         ).encode(y="y:Q")
         chart = zero_line + lines
 
+    # 모델이 가동 중이라고 판단한 10초 구간은 배경을 붉게 칠한다.
+    if states is not None:
+        busy = states[(states["predict"] == 1) & (states.index >= df["time"].iloc[0])]
+
+        if not busy.empty:
+            spans = pd.DataFrame({"start": busy.index,
+                                  "end": busy.index + pd.Timedelta(RESAMPLE)})
+            shade = alt.Chart(spans).mark_rect(
+                color=PRINTING_COLOR, opacity=0.12
+            ).encode(x="start:T", x2="end:T")
+            chart = shade + chart
+
     st.altair_chart(chart.properties(height=650), use_container_width=True)
 
 
@@ -332,7 +450,7 @@ def chart_page():
 
 
 # =========================
-# 5. 요약 페이지 (상태 판단, 값 카드, 그래프 4개)
+# 6. 요약 페이지 (상태 판단, 값 카드, 그래프 4개)
 # =========================
 
 def judge(latest):
@@ -378,6 +496,7 @@ def live_view(minutes):
     previous = before.iloc[-1] if not before.empty else df.iloc[0]
 
     judge(latest)
+    printer_status(rows)
 
     cards = [
         ("eCO2 (ppm)", "eco2", "{:,.0f}", "inverse"),
@@ -427,7 +546,7 @@ def overview_page():
 
 
 # =========================
-# 6. 실행
+# 7. 실행
 # =========================
 
 st.set_page_config(page_title="라온마루 공기질", layout="wide")
