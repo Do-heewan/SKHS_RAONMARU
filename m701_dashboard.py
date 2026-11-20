@@ -5,8 +5,11 @@
 # 페이지 두 개(그래프 / 요약)가 같은 수집기를 함께 쓴다. 왼쪽 메뉴에서 고른다.
 # models/printer_tree.joblib 이 있으면 3D 프린터 가동 여부도 함께 보여 준다.
 # (모델은 python m701_train_classifier.py 로 만든다.)
+# models/forecast_*.joblib 이 있으면 10분 뒤 예상 값도 보여 준다.
+# (모델은 python m701_train_forecast.py 로 만든다.)
 
 import csv
+import glob
 import os
 import threading
 import time
@@ -75,6 +78,17 @@ RESAMPLE = "10s"         # 학습 데이터와 같은 10초 평균
 WINDOW = "60s"           # 학습 데이터와 같은 60초 이동평균
 CONFIRM_BINS = 3         # 최근 3구간(30초)의 다수결로 상태를 정한다
 PRINTING_COLOR = "#e15759"
+
+# 10분 뒤 예측 (m701_train_forecast.py 로 만든 모델을 모두 불러온다)
+FORECAST_FILES = os.path.join("models", "forecast_*.joblib")
+FORECAST_NAMES = {
+    "eco2": ("eCO2", "ppm", "{:,.0f}"),
+    "tvoc": ("TVOC", "", "{:,.0f}"),
+    "pm25": ("PM2.5", "µg/m³", "{:,.0f}"),
+    "pm10": ("PM10", "µg/m³", "{:,.0f}"),
+    "temperature": ("온도", "°C", "{:.1f}"),
+    "humidity": ("습도", "%", "{:.1f}")
+}
 
 
 # =========================
@@ -345,7 +359,134 @@ def printer_status(rows):
 
 
 # =========================
-# 5. 그래프 페이지
+# 5. 10분 뒤 예측
+# =========================
+
+def get_forecast_models():
+
+    models = {}
+
+    for path in sorted(glob.glob(FORECAST_FILES)):
+        try:
+            bundle = load_model(path, os.path.getmtime(path))
+        except Exception:
+            continue
+        models[bundle["target"]] = bundle
+
+    # 화면에 보일 순서를 eCO2, TVOC, ... 순서로 맞춘다.
+    return {t: models[t] for t in FORECAST_NAMES if t in models}
+
+
+def predict_future(rows, bundle, states):
+
+    target = bundle["target"]
+    columns = list(dict.fromkeys(bundle["inputs"] + [target]))
+    frame = pd.DataFrame(rows).set_index("time")
+
+    # 학습 데이터와 같은 10초 평균 + 60초 이동평균
+    clean = frame[columns].resample(RESAMPLE).mean()
+    clean = clean[clean.index + pd.Timedelta(RESAMPLE) <= frame.index[-1]]
+    smooth = clean.rolling(WINDOW, min_periods=1).mean()
+    smooth = smooth[clean[columns[0]].notna()]
+
+    if smooth.empty:
+        return None
+
+    # 학습할 때와 같은 특징 (m701_train_forecast.py 참고)
+    features = pd.DataFrame(index=smooth.index)
+
+    for name in columns:
+        now = smooth[name]
+        features[f"{name}_now"] = now
+
+        for lag in bundle["lags_minutes"]:
+            before = now.shift(freq=f"{lag}min").reindex(now.index)
+            features[f"{name}_change_{lag}m"] = now - before
+
+    for name in ["eco2", "tvoc"]:
+        now = smooth[name]
+        lowest = now.rolling(f"{bundle['baseline_minutes']}min").min()
+        features[f"{name}_rise"] = now - lowest
+
+    if bundle["with_state"]:
+        if states is None:
+            return None
+        features["printing"] = states["predict"].reindex(features.index)
+
+    # 10분 전 값이 아직 없으면(수집 시작 10분 이내) 예측하지 않는다.
+    latest = features.iloc[[-1]]
+
+    if latest[bundle["features"]].isna().any(axis=None):
+        return None
+
+    now = latest[f"{target}_now"].iloc[0]
+    change = bundle["model"].predict(latest[bundle["features"]])[0]
+
+    return {
+        "time": latest.index[0],
+        "now": now,
+        "value": now + change,
+        "horizon": bundle["horizon_minutes"]
+    }
+
+
+def future_values(rows, states):
+
+    models = get_forecast_models()
+    results = {target: predict_future(rows, bundle, states)
+               for target, bundle in models.items()}
+
+    return results, models
+
+
+def forecast_line(results, models):
+
+    if not models:
+        st.caption("10분 뒤 예측: 모델이 없습니다. "
+                   "python m701_train_forecast.py 로 먼저 학습하세요.")
+        return
+
+    parts = []
+
+    for target, result in results.items():
+        name, unit, fmt = FORECAST_NAMES[target]
+
+        if result is None:
+            parts.append(f"{name} 준비 중")
+        else:
+            parts.append(f"{name} {fmt.format(result['value'])}{unit} "
+                         f"({result['value'] - result['now']:+.1f})")
+
+    horizon = next(iter(models.values()))["horizon_minutes"]
+    text = f"**{horizon}분 뒤 예상:** " + " · ".join(parts)
+
+    if any(result is None for result in results.values()):
+        text += " (예측하려면 10분 이상 데이터가 필요합니다)"
+
+    st.markdown(text)
+
+
+def forecast_alert(results):
+
+    # 학교 기준을 넘을 것으로 예상되면 미리 알려 준다.
+    for key, (name, unit, limit) in STANDARDS.items():
+        result = results.get(key)
+
+        if result is None:
+            continue
+
+        value = result["value"]
+        text = (f"{result['horizon']}분 뒤 {name}: {value:,.0f}{unit} 예상 "
+                f"(기준 {limit:,}{unit})")
+
+        if value >= limit:
+            st.error("미리 환기하세요. " + text)
+        elif value >= limit * CAUTION_RATIO:
+            st.warning("곧 기준에 가까워집니다. " + text)
+
+
+# =========================
+# 6. 그래프 페이지
 # =========================
 
 @st.fragment(run_every=REFRESH)
@@ -361,6 +502,9 @@ def live_chart(selected, mode):
         return
 
     states = printer_status(rows)
+    results, models = future_values(rows, states)
+    forecast_line(results, models)
+    forecast_alert(results)
 
     if not selected:
         st.info("위에서 보고 싶은 항목을 누르세요.")
@@ -394,22 +538,51 @@ def live_chart(selected, mode):
         y = alt.Y("value:Q", title=None)
         tooltip = ["time:T", "item:N", "value:Q"]
 
-    lines = alt.Chart(long).mark_line().encode(
-        x=alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M:%S")),
-        y=y,
-        color=alt.Color(
-            "item:N", title=None,
-            # 켜진 항목만 범례에 보이되, 항목별 색은 항상 같게
-            scale=alt.Scale(
-                domain=selected,
-                range=[SERIES[name][1] for name in selected]
-            ),
-            legend=alt.Legend(orient="top")
+    x = alt.X("time:T", title=None, axis=alt.Axis(format="%H:%M:%S"))
+    color = alt.Color(
+        "item:N", title=None,
+        # 켜진 항목만 범례에 보이되, 항목별 색은 항상 같게
+        scale=alt.Scale(
+            domain=selected,
+            range=[SERIES[name][1] for name in selected]
         ),
-        tooltip=tooltip
+        legend=alt.Legend(orient="top")
+    )
+
+    lines = alt.Chart(long).mark_line().encode(
+        x=x, y=y, color=color, tooltip=tooltip
     )
 
     chart = lines
+
+    # 예측 모델이 있는 항목은 지금부터 10분 뒤 예상 값까지 점선으로 잇는다.
+    future = []
+
+    for name in selected:
+        column = SERIES[name][0]
+        result = results.get(column)
+
+        if result is None:
+            continue
+
+        first = df[column].iloc[0]
+
+        if mode == PERCENT and first == 0:
+            continue
+
+        later = result["time"] + pd.Timedelta(minutes=result["horizon"])
+
+        for when, value in [(result["time"], result["now"]), (later, result["value"])]:
+            future.append({
+                "time": when, "item": name, "value": value,
+                "change": (value - first) / first * 100 if first else 0
+            })
+
+    if future:
+        dashed = alt.Chart(pd.DataFrame(future)).mark_line(
+            strokeDash=[6, 4], point=True
+        ).encode(x=x, y=y, color=color, tooltip=tooltip)
+        chart = chart + dashed
 
     if mode == PERCENT:
         zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(
@@ -450,7 +623,7 @@ def chart_page():
 
 
 # =========================
-# 6. 요약 페이지 (상태 판단, 값 카드, 그래프 4개)
+# 7. 요약 페이지 (상태 판단, 값 카드, 그래프 4개)
 # =========================
 
 def judge(latest):
@@ -496,7 +669,11 @@ def live_view(minutes):
     previous = before.iloc[-1] if not before.empty else df.iloc[0]
 
     judge(latest)
-    printer_status(rows)
+    states = printer_status(rows)
+
+    # 10분 뒤 예상 값 (기준을 넘을 것 같으면 먼저 알려 준다)
+    results, models = future_values(rows, states)
+    forecast_alert(results)
 
     cards = [
         ("eCO2 (ppm)", "eco2", "{:,.0f}", "inverse"),
@@ -513,6 +690,25 @@ def live_view(minutes):
             label, fmt.format(latest[key]),
             delta=f"{change:+.1f} (1분)", delta_color=color
         )
+
+    # 예측 카드는 위의 현재 값 카드와 같은 칸에 맞춰 놓는다. (모델이 없는 칸은 비움)
+    if models:
+        for col, (_, key, fmt, _) in zip(st.columns(len(cards)), cards):
+            if key not in results:
+                continue
+
+            name = FORECAST_NAMES[key][0]
+            result = results[key]
+            label = f"{models[key]['horizon_minutes']}분 뒤 {name} 예상"
+
+            if result is None:
+                col.metric(label, "준비 중", help="예측하려면 10분 이상 데이터가 필요합니다.")
+            else:
+                col.metric(label, fmt.format(result["value"]),
+                           delta=f"{result['value'] - result['now']:+.1f} (지금 대비)",
+                           delta_color="off")
+    else:
+        forecast_line(results, models)
 
     recent = df[df.index >= df.index[-1] - timedelta(minutes=minutes)]
 
@@ -546,7 +742,7 @@ def overview_page():
 
 
 # =========================
-# 7. 실행
+# 8. 실행
 # =========================
 
 st.set_page_config(page_title="라온마루 공기질", layout="wide")
