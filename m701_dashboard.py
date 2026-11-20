@@ -10,6 +10,7 @@
 
 import csv
 import glob
+import json
 import os
 import threading
 import time
@@ -88,6 +89,16 @@ FORECAST_NAMES = {
     "pm10": ("PM10", "µg/m³", "{:,.0f}"),
     "temperature": ("온도", "°C", "{:.1f}"),
     "humidity": ("습도", "%", "{:.1f}")
+}
+
+# LED/부저 알림 상태 (m701_alert.py 가 판단할 때마다 이 파일에 적는다)
+ALERT_STATUS_FILE = os.path.join(DATA_DIR, "alert_status.json")
+ALERT_STALE_SECONDS = 40  # 이보다 오래 갱신되지 않으면 알림 프로그램이 멈춘 것으로 본다
+ALERT_LIGHTS = {
+    0: (":green-background[좋음]", "초록 LED"),
+    1: (":orange-background[주의]", "노란 LED"),
+    2: (":red-background[미리 환기]", "빨간 LED 깜빡임 · 부저 짧게 2번"),
+    3: (":red-background[환기 필요]", "빨간 LED · 부저 길게 3번")
 }
 
 
@@ -517,6 +528,55 @@ def forecast_alert(results):
             st.warning("곧 기준에 가까워집니다. " + text)
 
 
+# LED/부저 알림 상태. 대시보드가 따로 판단하지 않고
+# m701_alert.py 가 실제로 켠 LED 상태를 그대로 보여 준다.
+def alert_status():
+
+    if not os.path.exists(ALERT_STATUS_FILE):
+        st.caption("LED 알림: 꺼져 있습니다. (python m701_alert.py 로 켭니다)")
+        return
+
+    try:
+        with open(ALERT_STATUS_FILE, encoding="utf-8") as file:
+            status = json.load(file)
+        updated = datetime.fromisoformat(status["updated"])
+    except (OSError, ValueError, KeyError):
+        return  # 파일을 바꿔 끼우는 순간이면 다음 갱신 때 보여 준다.
+
+    age = (datetime.now() - updated).total_seconds()
+
+    if not status.get("running", True):
+        st.caption(f"LED 알림: 꺼져 있습니다. (마지막 실행 {updated:%H:%M:%S}, "
+                   "python m701_alert.py 로 켭니다)")
+        return
+
+    if age > ALERT_STALE_SECONDS:
+        st.caption(f"LED 알림: 응답이 없습니다. (마지막 갱신 {age:.0f}초 전) "
+                   "m701_alert.py 가 실행 중인지 확인하세요.")
+        return
+
+    level = status.get("level")
+    reasons = status.get("reasons") or []
+
+    if level is None:
+        st.markdown("**LED 알림:** :gray-background[LED 꺼짐] " + ", ".join(reasons))
+        return
+
+    badge, light = ALERT_LIGHTS[level]
+    notes = []
+
+    if status.get("mute"):
+        notes.append("부저 끔")
+    if not status.get("gpio", True):
+        notes.append("GPIO 없음, 화면에만 표시")
+
+    extra = f" ({', '.join(notes)})" if notes else ""
+    st.markdown(f"**LED 알림:** {badge} {light}{extra}")
+
+    if reasons:
+        st.caption("이유: " + ", ".join(reasons))
+
+
 # =========================
 # 6. 그래프 페이지
 # =========================
@@ -537,6 +597,7 @@ def live_chart(selected, mode):
     results, models = future_values(rows, states)
     forecast_note(results, models)
     forecast_alert(results)
+    alert_status()
 
     if not selected:
         st.info("위에서 보고 싶은 항목을 누르세요.")
@@ -709,6 +770,7 @@ def live_view(minutes):
     # 10분 뒤 예상 값 (기준을 넘을 것 같으면 먼저 알려 준다)
     results, models = future_values(rows, states)
     forecast_alert(results)
+    alert_status()
 
     cards = [
         ("eCO2 (ppm)", "eco2", "{:,.0f}", "inverse"),

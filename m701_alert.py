@@ -29,6 +29,7 @@
 import argparse
 import csv
 import glob
+import json
 import os
 import time
 from collections import deque
@@ -44,6 +45,8 @@ DATA_DIR = "data"
 SESSION_FILES = os.path.join(DATA_DIR, "session_*.csv")
 CLASSIFIER_FILE = os.path.join("models", "printer_tree.joblib")
 FORECAST_FILES = os.path.join("models", "forecast_*.joblib")
+# 대시보드가 LED 상태를 보여 줄 수 있도록 지금 상태를 이 파일에 적어 둔다. (json 은 깃에 올라가지 않음)
+STATUS_FILE = os.path.join(DATA_DIR, "alert_status.json")
 
 # 학교 교실 공기질 유지 기준 (대시보드와 같음). TVOC 는 단위가 확인되지 않아 판단하지 않는다.
 STANDARDS = {
@@ -348,8 +351,10 @@ def evaluate(history, classifier, forecasts):
 
 class Alarm:
 
-    def __init__(self, signal, classifier, forecasts, repeat_minutes):
+    def __init__(self, signal, classifier, forecasts, repeat_minutes, status_file=None):
         self.signal = signal
+        self.status_file = status_file
+        self.last_status = None
         self.classifier = classifier
         self.forecasts = forecasts
         self.repeat = pd.Timedelta(minutes=repeat_minutes)
@@ -390,6 +395,39 @@ class Alarm:
                 self.last_beep[level] = now
 
         self.level = level
+        self.write_status(level, reasons, text, now)
+
+    def refresh_status(self):
+        if self.last_status is not None:
+            self.write_status(*self.last_status)
+
+    def write_status(self, level, reasons, text="", data_time=None, running=True):
+
+        if self.status_file is None:
+            return
+
+        self.last_status = (level, reasons, text, data_time, running)
+
+        status = {
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "running": running,
+            "level": level,
+            "name": LEVELS[level] if level is not None else None,
+            "reasons": reasons,
+            "text": text,
+            "data_time": data_time.isoformat(timespec="seconds") if data_time else None,
+            "gpio": self.signal.real,
+            "mute": self.signal.mute
+        }
+
+        # 대시보드가 쓰다 만 파일을 읽지 않도록 임시 파일에 다 쓴 뒤 바꿔 끼운다.
+        os.makedirs(os.path.dirname(self.status_file), exist_ok=True)
+        temp = self.status_file + ".tmp"
+
+        with open(temp, "w", encoding="utf-8") as file:
+            json.dump(status, file, ensure_ascii=False)
+
+        os.replace(temp, self.status_file)
 
 
 # =========================
@@ -478,6 +516,7 @@ def run_follow(alarm, path):
                 if not warned:
                     print("데이터를 기다리는 중입니다. 대시보드나 m701_csv.py 를 먼저 켜세요.")
                     warned = True
+                alarm.write_status(None, ["데이터를 기다리는 중"])
             elif time.time() - last_new > NO_DATA_SECONDS:
                 if not warned:
                     print(f"{NO_DATA_SECONDS}초 넘게 새 데이터가 없습니다. "
@@ -485,6 +524,10 @@ def run_follow(alarm, path):
                     alarm.signal.show(None)
                     alarm.level = None
                     warned = True
+                alarm.write_status(None, ["새 데이터가 들어오지 않음"])
+            else:
+                # 새 줄이 아직 없을 뿐이면 상태는 그대로 두고 갱신 시각만 새로 적는다.
+                alarm.refresh_status()
 
             time.sleep(CHECK_SECONDS)
 
@@ -552,6 +595,7 @@ def main():
 
     print("M701B LED/부저 환기 알림")
     signal = Signal(args)
+    alarm = None
 
     try:
         if args.test:
@@ -559,7 +603,9 @@ def main():
             return
 
         classifier, forecasts = load_models(args)
-        alarm = Alarm(signal, classifier, forecasts, args.repeat)
+        # 연습(--replay) 결과는 대시보드에 보이지 않도록 상태 파일을 쓰지 않는다.
+        status_file = None if args.replay else STATUS_FILE
+        alarm = Alarm(signal, classifier, forecasts, args.repeat, status_file)
 
         if args.replay:
             run_replay(alarm, args.replay, args.speed)
@@ -568,6 +614,10 @@ def main():
 
     finally:
         signal.close()
+
+        # 꺼졌다는 것을 대시보드가 알 수 있도록 남긴다.
+        if alarm is not None:
+            alarm.write_status(None, [], running=False)
 
 
 if __name__ == "__main__":
