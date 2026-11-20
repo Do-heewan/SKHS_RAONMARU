@@ -16,7 +16,7 @@ from sklearn.tree import DecisionTreeRegressor
 # 1. 기본 설정
 # =========================
 #
-# 지금까지의 센서 값으로 10분 뒤 공기질(기본: eCO2)을 예측하는 모델을 학습한다.
+# 지금까지의 센서 값으로 10분 뒤 공기질(기본: eCO2, TVOC)을 예측하는 모델을 학습한다.
 # 입력은 m701_state_clean.py --all 이 만든 data/labeled/clean_state_all.csv 이다.
 #
 # 학습: 시뮬레이션 데이터(aug_sim_*)
@@ -185,8 +185,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default=INPUT_FILE,
                         help="전처리된 라벨링 데이터 (m701_state_clean.py --all 결과)")
-    parser.add_argument("--target", default="eco2", choices=list(TARGETS),
-                        help="예측할 값")
+    parser.add_argument("--target", nargs="+", default=["eco2", "tvoc"],
+                        choices=list(TARGETS),
+                        help="예측할 값 (여러 개 가능, 예: --target eco2 tvoc humidity)")
     parser.add_argument("--horizon", type=int, default=10,
                         help="몇 분 뒤를 예측할지")
     parser.add_argument("--model", default="boosting", choices=list(MODELS),
@@ -209,16 +210,28 @@ def main():
     plt.rcParams["font.family"] = ["NanumGothic", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    features = feature_names(args.target, args.with_state)
-    name = TARGETS[args.target]
+    # 같은 항목을 두 번 적어도 한 번만 학습한다.
+    targets = list(dict.fromkeys(args.target))
 
     # 1) 불러오기
     step(1, "전처리된 데이터 불러오기")
     df = pd.read_csv(args.input, parse_dates=["time"])
     print(f"파일: {args.input}")
     print(f"크기: {len(df)}행, 세션 {df['session'].nunique()}개")
-    print(f"예측할 값: {args.horizon}분 뒤 {name}")
+    print(f"예측할 값: {args.horizon}분 뒤 " + ", ".join(TARGETS[t] for t in targets))
     pause(args)
+
+    # 항목마다 2~6단계를 반복해 models/forecast_<항목>.joblib 을 하나씩 만든다.
+    for index, target in enumerate(targets, start=1):
+        if len(targets) > 1:
+            print(f"\n########## 항목 {index}/{len(targets)}: {TARGETS[target]} ##########")
+        train_target(df, target, args)
+
+
+def train_target(df, target, args):
+
+    features = feature_names(target, args.with_state)
+    name = TARGETS[target]
 
     # 2) 특징과 정답 만들기
     step(2, f"특징과 정답({args.horizon}분 뒤 변화량) 만들기")
@@ -226,7 +239,7 @@ def main():
     parts = []
 
     for index, (session, group) in enumerate(groups, start=1):
-        parts.append(add_features(group, args.target, args.horizon))
+        parts.append(add_features(group, target, args.horizon))
         progress(index, len(groups), session)
 
     data = pd.concat(parts, ignore_index=True)
@@ -235,7 +248,7 @@ def main():
     print(f"특징: {features}")
     print(f"처음 {max(LAGS)}분(과거가 없음)과 마지막 {args.horizon}분(정답이 없음)은 "
           f"뺐습니다: {before - len(data)}행")
-    print(data[["session", f"{args.target}_now", "future", "target_change"]]
+    print(data[["session", f"{target}_now", "future", "target_change"]]
           .head(3).round(1).to_string())
     pause(args)
 
@@ -275,11 +288,11 @@ def main():
 
     # 5) 실제 데이터로 시험
     step(5, "실제로 측정한 데이터로 시험하기")
-    now = test[f"{args.target}_now"]
+    now = test[f"{target}_now"]
     test["predict_persist"] = now
 
     # 큰 변화가 있던 구간(프린터 가동 등)과 평온한 구간을 나눠서도 본다.
-    big = (test["future"] - now).abs() >= BIG_CHANGE[args.target]
+    big = (test["future"] - now).abs() >= BIG_CHANGE[target]
 
     def row(title, predict):
         mae, rmse = scores(test["future"], predict)
@@ -300,7 +313,7 @@ def main():
     print(f"{args.horizon}분 뒤 {name} 예측 오차 (작을수록 좋음)")
     print(result.round(2).to_string(
         formatters={"지속 예측보다": lambda v: f"{v:+.0f}%"}))
-    print(f"\n큰 변화: {args.horizon}분 동안 {BIG_CHANGE[args.target]} 넘게 변한 구간 "
+    print(f"\n큰 변화: {args.horizon}분 동안 {BIG_CHANGE[target]} 넘게 변한 구간 "
           f"({int(big.sum())}행) / 평온: 나머지 ({int((~big).sum())}행)")
     print("MAE: 평균적으로 몇만큼 틀렸나 / RMSE: 크게 틀린 것을 더 무겁게 본 오차")
     print("지속 예측: '10분 뒤에도 지금과 같다'고 보는 가장 단순한 방법."
@@ -321,14 +334,14 @@ def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     test["predict"] = test[f"predict_{args.model}"]
-    plot_test(test, args.target, args.horizon, MODELS[args.model][0],
-              os.path.join(RESULT_DIR, f"forecast_{args.target}_test.png"), args)
+    plot_test(test, target, args.horizon, MODELS[args.model][0],
+              os.path.join(RESULT_DIR, f"forecast_{target}_test.png"), args)
 
-    model_file = os.path.join(MODEL_DIR, f"forecast_{args.target}.joblib")
+    model_file = os.path.join(MODEL_DIR, f"forecast_{target}.joblib")
     joblib.dump({
         "model": chosen,
         "features": features,
-        "target": args.target,
+        "target": target,
         "horizon_minutes": args.horizon,
         "inputs": INPUTS,
         "lags_minutes": LAGS,
