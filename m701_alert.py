@@ -36,6 +36,8 @@ from collections import deque
 from datetime import datetime
 
 import pandas as pd
+import warnings
+warnings.filterwarnings("ignore", message="The 'generic' unit", category=DeprecationWarning)
 
 # =========================
 # 1. 기본 설정
